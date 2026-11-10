@@ -1,0 +1,102 @@
+name: Verify and attach C++ source distributions
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  verify-package:
+    name: Build, test and package source archives
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify release tag equals CMake version
+        if: github.event_name == 'release'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          cmake = pathlib.Path("CMakeLists.txt").read_text()
+          matched = re.search(r"project\s*\(\s*pikaid\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)", cmake)
+          expected = os.environ["GITHUB_REF_NAME"][1:]
+          if not matched or matched.group(1) != expected:
+              raise SystemExit(f"CMake project version must match release v{expected}")
+          PY
+
+      - name: Configure C++17 release build
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPIKAID_BUILD_TESTS=ON \
+            -DPIKAID_BUILD_EXAMPLES=ON \
+            -DPIKAID_WARNINGS_AS_ERRORS=ON
+
+      - name: Compile and run tests
+        run: |
+          cmake --build build --parallel 2
+          ctest --test-dir build --output-on-failure
+
+      - name: Build portable source distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          (
+            cd dist
+            cpack -G TGZ --config ../build/CPackSourceConfig.cmake
+            cpack -G ZIP --config ../build/CPackSourceConfig.cmake
+          )
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -name '*.zip' | wc -l)" -eq 1
+          (cd dist && sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt)
+          if tar -tzf dist/*.tar.gz | grep -E '(^|/)\.ai(/|$)|(^|/)node_modules(/|$)'; then
+            echo "::error::Local-only files found in source archive"
+            exit 1
+          fi
+
+      - name: Store verified distributions for release upload
+        if: github.event_name == 'release'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cpp-source-distributions
+          path: dist/
+          if-no-files-found: error
+
+  upload-release-assets:
+    name: Attach archives to published GitHub release
+    if: github.event_name == 'release'
+    needs: verify-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified source distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cpp-source-distributions
+          path: dist/
+
+      - name: Upload archives without overwriting existing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
