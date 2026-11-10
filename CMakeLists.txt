@@ -190,6 +190,7 @@ if(PIKAID_IS_TOP_LEVEL)
       "/[.]ai/"
       "/[.]ai$"
       "/build[^/]*/"
+      "/dist/"
       "/cmake-build-[^/]*/"
       "/[.]cache/"
       "/CMakeFiles/"
