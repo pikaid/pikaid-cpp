@@ -1,0 +1,443 @@
+name: CI
+
+on:
+  # Run on every pushed branch so no commit can be pushed without a CI
+  # attempt, including work branches that are not yet part of a pull request.
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CTEST_OUTPUT_ON_FAILURE: 1
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux GCC Debug
+            os: ubuntu-latest
+            cxx: g++
+            build_type: Debug
+          - name: Linux GCC Release
+            os: ubuntu-latest
+            cxx: g++
+            build_type: Release
+          - name: Linux Clang Debug
+            os: ubuntu-latest
+            cxx: clang++
+            build_type: Debug
+          - name: macOS AppleClang Debug
+            os: macos-latest
+            cxx: clang++
+            build_type: Debug
+          - name: macOS AppleClang Release
+            os: macos-latest
+            cxx: clang++
+            build_type: Release
+          - name: Windows MSVC Debug
+            os: windows-latest
+            build_type: Debug
+          - name: Windows MSVC Release
+            os: windows-latest
+            build_type: Release
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Set up MSVC developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake_args=(
+            -S . -B build -G Ninja
+            "-DCMAKE_BUILD_TYPE=${{ matrix.build_type }}"
+            -DPIKAID_WARNINGS_AS_ERRORS=ON
+          )
+          if [ -n "${{ matrix.cxx }}" ]; then
+            cmake_args+=("-DCMAKE_CXX_COMPILER=${{ matrix.cxx }}")
+          fi
+          cmake "${cmake_args[@]}"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Run example
+        shell: bash
+        run: |
+          for candidate in build/pikaid_example.exe build/pikaid_example; do
+            if [ -f "$candidate" ]; then
+              "$candidate"
+              exit $?
+            fi
+          done
+          echo "pikaid_example was not found" >&2
+          exit 1
+
+  sanitizers:
+    name: ${{ matrix.os }} ASan+UBSan
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DPIKAID_SANITIZE=ON
+          -DPIKAID_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  coverage:
+    name: Coverage (Linux Clang)
+    runs-on: ubuntu-latest
+    env:
+      LLVM_PROFILE_FILE: ${{ github.workspace }}/build-cov/pikaid-%p.profraw
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Resolve matching LLVM tools
+        shell: bash
+        run: |
+          clang_major="$(clang++ -dumpversion | cut -d. -f1)"
+          tools="/usr/lib/llvm-${clang_major}/bin"
+          if [ ! -x "${tools}/llvm-profdata" ] || [ ! -x "${tools}/llvm-cov" ]; then
+            sudo apt-get update
+            sudo apt-get install -y "llvm-${clang_major}"
+          fi
+          for tool in llvm-profdata llvm-cov; do
+            if [ ! -x "${tools}/${tool}" ]; then
+              echo "::error::${tool} not found in ${tools}" >&2
+              exit 1
+            fi
+          done
+          {
+            echo "LLVM_PROFDATA=${tools}/llvm-profdata"
+            echo "LLVM_COV=${tools}/llvm-cov"
+          } >> "$GITHUB_ENV"
+          "${tools}/llvm-profdata" --version
+          "${tools}/llvm-cov" --version
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-cov -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DPIKAID_COVERAGE=ON
+          -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build build-cov
+
+      - name: Run tests with coverage
+        run: ctest --test-dir build-cov --output-on-failure
+
+      - name: Enforce line coverage
+        shell: bash
+        run: |
+          mapfile -t profiles < <(find build-cov -name '*.profraw' -print)
+          if [ "${#profiles[@]}" -eq 0 ]; then
+            echo "::error::no LLVM profile files were produced" >&2
+            exit 1
+          fi
+          "${LLVM_PROFDATA}" merge -sparse "${profiles[@]}" \
+            -o build-cov/pikaid.profdata
+          "${LLVM_COV}" report ./build-cov/tests/pikaid_tests \
+            -instr-profile=build-cov/pikaid.profdata \
+            -ignore-filename-regex='(^|/)(tests|examples)/'
+          "${LLVM_COV}" export ./build-cov/tests/pikaid_tests \
+            -instr-profile=build-cov/pikaid.profdata \
+            -ignore-filename-regex='(^|/)(tests|examples)/' \
+            > build-cov/coverage.json
+          python3 - <<'PY'
+          import json
+
+          with open("build-cov/coverage.json", encoding="utf-8") as handle:
+              data = json.load(handle)
+
+          lines = data["data"][0]["totals"]["lines"]
+          covered = lines["covered"]
+          total = lines["count"]
+          percent = 100.0 * covered / total if total else 0.0
+          print(f"line coverage: {covered}/{total} = {percent:.2f}%")
+          if percent < 90.0:
+              raise SystemExit(
+                  f"line coverage {percent:.2f}% is below the required 90.00%"
+              )
+          PY
+
+  packaging:
+    name: Packaging and consumer smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # The runner's preinstalled CMake and generator are used here instead of
+      # a tool-setup action, which would add a tool directory to the working
+      # tree and leak it into the source package.
+      #
+      # `.ai/` is a local-only workspace. A regression here is a tracked file,
+      # because checkout only materialises what the index contains.
+      - name: Enforce untracked local-only .ai workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$(git ls-files -- .ai)" ]; then
+            echo "::error::.ai must never be tracked" >&2
+            git ls-files -- .ai >&2
+            exit 1
+          fi
+          if git archive --format=tar HEAD | tar -tf - | grep -qE '(^|/)\.ai(/|$)'; then
+            echo "::error::.ai appears in git archive output" >&2
+            exit 1
+          fi
+
+      - name: Configure, build and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPIKAID_WARNINGS_AS_ERRORS=ON
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+
+      - name: Inspect source package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build --target package_source
+          archive="build/pikaid-1.0.0.tar.gz"
+          test -f "$archive"
+          tar -tzf "$archive" > source-files.txt
+          cat source-files.txt
+          if grep -qE '(^|/)\.ai(/|$)' source-files.txt; then
+            echo "::error::.ai appears in the source package" >&2
+            exit 1
+          fi
+          if grep -qE '(^|/)\.git(/|$)' source-files.txt; then
+            echo "::error::.git appears in the source package" >&2
+            exit 1
+          fi
+          for required in \
+            LICENSE README.md CHANGELOG.md CMakeLists.txt \
+            cmake/pikaidConfig.cmake.in \
+            include/pikaid/pikaid.hpp src/pikaid.cpp \
+            tests/CMakeLists.txt tests/vectors/pikaid-v1.json \
+            examples/basic.cpp; do
+            if ! grep -qx "pikaid-1.0.0/$required" source-files.txt; then
+              echo "::error::source package is missing $required" >&2
+              exit 1
+            fi
+          done
+          # The source package must be exactly the tracked file set: no local
+          # workspace artifact may leak in, and no tracked file may be hidden
+          # by an overbroad ignore pattern.
+          grep -v '/$' source-files.txt \
+            | sed 's|^pikaid-1.0.0/||' | sort > packaged-files.txt
+          git ls-files | sort > tracked-files.txt
+          if ! diff -u tracked-files.txt packaged-files.txt; then
+            echo "::error::source package does not match the tracked file set" >&2
+            exit 1
+          fi
+
+      # Build, package, install and consume both supported library flavours so
+      # that the exported CMake package and the CPack archives are proven to be
+      # self-contained.
+      - name: Package and consume static and shared builds
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p consumer
+          cat > consumer/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.16)
+          project(pikaid_consumer LANGUAGES CXX)
+          find_package(pikaid 1.0 CONFIG REQUIRED)
+          add_executable(consumer main.cpp)
+          target_link_libraries(consumer PRIVATE pikaid::pikaid)
+          EOF
+          cat > consumer/main.cpp <<'EOF'
+          #include <pikaid/pikaid.hpp>
+
+          #include <cstdint>
+          #include <cstdio>
+          #include <string>
+
+          int main()
+          {
+              const std::string id = pikaid::generate(1700000000);
+              if (id.size() != pikaid::string_length || !pikaid::is_valid(id)) {
+                  return 1;
+              }
+              if (pikaid::timestamp(id) != 1700000000) {
+                  return 2;
+              }
+              if (pikaid::from_binary(pikaid::to_binary(id)) != id) {
+                  return 3;
+              }
+              std::puts(id.c_str());
+              return 0;
+          }
+          EOF
+
+          for mode in static shared; do
+            build="build-${mode}"
+            shared_flag=OFF
+            if [ "$mode" = shared ]; then
+              shared_flag=ON
+            fi
+            cmake -S . -B "$build" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS="$shared_flag" \
+              -DPIKAID_BUILD_TESTS=OFF \
+              -DPIKAID_BUILD_EXAMPLES=OFF \
+              -DCMAKE_INSTALL_PREFIX="$PWD/${build}/prefix"
+            cmake --build "$build"
+            cmake --install "$build"
+            if find "${build}/prefix" -name '.ai' -type d -print -quit | grep -q .; then
+              echo "::error::.ai found in the ${mode} install tree" >&2
+              exit 1
+            fi
+            cpack --config "${build}/CPackConfig.cmake" -G TGZ \
+              -B "${build}/packages"
+            archive="$(find "${build}/packages" -maxdepth 1 -name '*.tar.gz' -print -quit)"
+            test -n "$archive"
+            tar -tzf "$archive" > "${build}/package-files.txt"
+            cat "${build}/package-files.txt"
+            if grep -qE '(^|/)\.ai(/|$)' "${build}/package-files.txt"; then
+              echo "::error::.ai appears in the ${mode} binary package" >&2
+              exit 1
+            fi
+            grep -qE '(^|/)include/pikaid/pikaid[.]hpp$' "${build}/package-files.txt"
+            grep -qE '(^|/)cmake/pikaid/pikaidConfig[.]cmake$' "${build}/package-files.txt"
+            grep -qE '(^|/)doc/pikaid/LICENSE$' "${build}/package-files.txt"
+            rm -rf "${build}/extracted"
+            mkdir -p "${build}/extracted"
+            tar -xzf "$archive" -C "${build}/extracted"
+            cmake -S consumer -B "${build}/consumer" \
+              -DCMAKE_PREFIX_PATH="$PWD/${build}/extracted"
+            cmake --build "${build}/consumer"
+            "${build}/consumer/consumer"
+          done
+
+  # Official PikaID conformance suite, pinned to the exact revision that
+  # defines conformance for this release. The suite is checked out read-only
+  # into the local-only .ai workspace, built against an *installed* pikaid
+  # package, and run through the test-only JSON-Lines adapter in
+  # tools/conformance. `--automated-only` exits 0 only when every automated
+  # check passes; a non-zero exit fails the job (no continue-on-error, no
+  # `|| true`) so the gate cannot be bypassed.
+  official-conformance:
+    name: Official PikaID conformance (pinned suite)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out implementation
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out official suite at pinned revision
+        uses: actions/checkout@v4
+        with:
+          repository: pikaid/pikaid-specs
+          ref: 059780cc0e5b113443812720d95c630649bf3aa3
+          path: .ai/official-suite/pikaid-specs
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install suite dependencies
+        run: >
+          python3 -m pip install --disable-pip-version-check
+          --requirement
+          .ai/official-suite/pikaid-specs/conformance/tools/requirements.txt
+
+      - name: Verify pinned fixture package
+        working-directory: .ai/official-suite/pikaid-specs/conformance
+        run: >
+          python3 tools/verify_vectors.py
+          --expect-status OFFICIAL
+          --expect-package-revision 1.0.0
+          --expect-spec-revision 1.0.4
+
+      - name: Run suite self-tests
+        working-directory: .ai/official-suite/pikaid-specs/conformance
+        run: |
+          python3 -m unittest discover -s tools/tests -v
+          node tools/verify_oracle_node.mjs
+
+      - name: Build and install the library
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-conformance \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPIKAID_BUILD_TESTS=OFF \
+            -DPIKAID_BUILD_EXAMPLES=OFF \
+            -DPIKAID_WARNINGS_AS_ERRORS=ON \
+            -DCMAKE_INSTALL_PREFIX="$PWD/build-conformance/prefix"
+          cmake --build build-conformance
+          cmake --install build-conformance
+
+      - name: Build the test-only adapter against the installed package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S tools/conformance -B build-adapter \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PWD/build-conformance/prefix" \
+            -DPIKAID_CONFORMANCE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-adapter
+
+      - name: Run official conformance suite
+        working-directory: .ai/official-suite/pikaid-specs/conformance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/run_adapter.py --automated-only \
+            --report-json "$GITHUB_WORKSPACE/build-adapter/conformance-report.json" \
+            -- "$GITHUB_WORKSPACE/build-adapter/pikaid_conformance_adapter"

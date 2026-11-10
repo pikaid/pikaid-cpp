@@ -1,0 +1,35 @@
+# Build directories
+/build*/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+Testing/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.exe
+
+# Coverage and profiler output
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.gcov
+coverage/
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+opencode.jsonc
+
+# Local-only agent workspace and reports. Deliberately explicit: a broad
+# hidden-directory pattern such as `/.??/` also masks tracked automation
+# directories like `.github/`.
+/.ai/
